@@ -1,0 +1,8 @@
+.git
+data
+media-job-api
+coverage.out
+.env*
+*.flac
+*.wav
+*.m4a

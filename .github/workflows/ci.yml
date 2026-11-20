@@ -1,0 +1,82 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.26.x', '1.27.x']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+      - name: Format
+        run: test -z "$(gofmt -l cmd internal)"
+      - run: go vet ./...
+      - name: Test with race detector and real audio tools
+        env:
+          REQUIRE_FFMPEG: '1'
+        run: go test -race -timeout 60s -count=1 ./...
+      - run: go build ./cmd/media-job-api
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t media-job-api:test .
+      - name: Exercise non-root container with a read-only root filesystem
+        run: |
+          set -eu
+          docker volume create media-job-ci
+          docker run -d --name media-job-ci --init --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --memory 512m --cpus 2 --pids-limit 128 \
+            -p 127.0.0.1:18080:8080 -e MEDIA_JOB_TOKEN=ci-smoke-only \
+            -v media-job-ci:/data media-job-api:test
+          trap 'docker logs media-job-ci; docker rm -f media-job-ci; docker volume rm media-job-ci' EXIT
+          python3 - <<'PY'
+          import io, json, time, urllib.request, wave
+          base = "http://127.0.0.1:18080"
+          for attempt in range(120):
+              try:
+                  urllib.request.urlopen(base + "/readyz", timeout=2).close()
+                  break
+              except OSError:
+                  time.sleep(0.5)
+          else:
+              raise RuntimeError("container did not become ready")
+          data = io.BytesIO()
+          with wave.open(data, "wb") as audio:
+              audio.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+              audio.writeframes(b"\x01\x00" * 800)
+          headers = {"Content-Type": "application/octet-stream",
+                     "Authorization": "Bearer ci-smoke-only"}
+          upload = urllib.request.Request(base + "/v1/jobs", data=data.getvalue(), headers=headers)
+          with urllib.request.urlopen(upload, timeout=10) as response:
+              assert response.status == 202
+              job_id = json.load(response)["id"]
+          for attempt in range(120):
+              request = urllib.request.Request(base + "/v1/jobs/" + job_id, headers=headers)
+              with urllib.request.urlopen(request, timeout=5) as response:
+                  job = json.load(response)
+              if job["status"] in ("succeeded", "failed"):
+                  break
+              time.sleep(0.25)
+          assert job["status"] == "succeeded", job
+          assert job["result"]["codec"] == "pcm_s16le", job
+          print("Container upload, decode, and digest passed")
+          PY

@@ -1,0 +1,12 @@
+/data/
+/media-job-api
+/coverage.out
+*.db
+*.db-shm
+*.db-wal
+*.flac
+*.wav
+*.m4a
+.env
+.env.*
+.DS_Store
